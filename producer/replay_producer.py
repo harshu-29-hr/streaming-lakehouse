@@ -1,11 +1,11 @@
 """Replay NYC TLC yellow-taxi trips into Kafka as a live event stream.
 
-Built up over Steps 6 to 9. For now it replays one month of trips in event-time
-order at a chosen speed, printing each event instead of sending it to Kafka.
+Built up over Steps 6 to 9. It replays one month of trips in event-time order
+at a chosen speed and sends each one to Kafka, keyed by pickup zone.
 
-Run from the project root:
-    python producer/replay_producer.py --speed 1 --limit 30
-    python producer/replay_producer.py > /dev/null
+Run from the project root (Kafka must be running):
+    python producer/replay_producer.py --limit 5000
+    python producer/replay_producer.py --dry-run --speed 1 --limit 30
 """
 
 import argparse
@@ -97,8 +97,51 @@ def to_event(row: dict) -> dict:
     return event
 
 
+class KafkaSink:
+    """Sends events to a Kafka topic."""
+
+    def __init__(self, bootstrap: str, topic: str):
+        from confluent_kafka import Producer  # imported here so --dry-run works without Kafka
+
+        self.topic = topic
+        self.failed = 0
+        self.producer = Producer({
+            "bootstrap.servers": bootstrap,
+            "client.id": "taxi-replay-producer",
+            "enable.idempotence": True,       # a retried send can't create a duplicate; implies acks=all
+            "compression.type": "zstd",       # smaller messages on the wire
+            "linger.ms": 20,                  # wait up to 20 ms so messages go out in batches
+            "partitioner": "murmur2_random",  # hash keys the same way Kafka's own Java tools do
+        })
+        # Record timestamps stay at the real send time. The trip's event time lives in the
+        # payload: stamping records with a January date would make Kafka's 7-day retention
+        # treat them as already expired and delete them.
+
+    def _on_delivery(self, err, msg) -> None:
+        """Called once per message, when Kafka confirms it arrived (or gives up)."""
+        if err is not None:
+            self.failed += 1
+            if self.failed <= 5:
+                log.error("Delivery failed: %s", err)
+
+    def send(self, key: str, value: bytes) -> None:
+        while True:
+            try:
+                self.producer.produce(self.topic, key=key, value=value, on_delivery=self._on_delivery)
+                break
+            except BufferError:  # the local send queue is full: let it drain, then retry
+                self.producer.poll(0.5)
+        self.producer.poll(0)  # handle any delivery confirmations that have come back
+
+    def close(self) -> int:
+        undelivered = self.producer.flush(30)  # wait up to 30 s for messages still in flight
+        if undelivered:
+            log.error("%d messages still undelivered at shutdown", undelivered)
+        return self.failed + undelivered
+
+
 class StdoutSink:
-    """Where events go for now: printed as `key<TAB>json`. Step 8 adds a Kafka sink."""
+    """--dry-run: print events as `key<TAB>json` instead of sending them."""
 
     def send(self, key: str, value: bytes) -> None:
         sys.stdout.write(f"{key}\t{value.decode()}\n")
@@ -144,10 +187,12 @@ def run(args: argparse.Namespace) -> int:
         log.error("No trips to replay.")
         return 1
 
-    sink = StdoutSink()
+    sink = StdoutSink() if args.dry_run else KafkaSink(args.bootstrap, args.topic)
     replayer = Replayer(sink, args.speed)
     t0 = table["event_time"][0].as_py()
-    log.info("Replaying at %s. Ctrl+C to stop.", f"{args.speed:g}x" if args.speed else "max speed")
+    target = "stdout" if args.dry_run else f"{args.bootstrap} / {args.topic}"
+    speed = f"{args.speed:g}x" if args.speed else "max speed"
+    log.info("Replaying to %s at %s. Ctrl+C to stop.", target, speed)
     try:
         # Convert rows to Python in chunks of 50,000 rather than all 3.5 million at once
         for batch in table.to_batches(max_chunksize=50_000):
@@ -169,6 +214,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="NYC TLC yellow taxi parquet file (default: %(default)s)")
     p.add_argument("--month", help="YYYY-MM the file covers (default: read from the file name)")
     p.add_argument("--limit", type=int, help="stop after this many trips")
+    p.add_argument("--bootstrap", default="localhost:9092", help="Kafka address (default: %(default)s)")
+    p.add_argument("--topic", default="taxi.trips.v1", help="Kafka topic (default: %(default)s)")
+    p.add_argument("--dry-run", action="store_true", help="print events instead of sending them to Kafka")
     p.add_argument("--speed", type=float, default=60.0,
                    help="replay speed vs. real time; 60 = one minute of trips per second, "
                         "0 = as fast as possible (default: %(default)s)")
