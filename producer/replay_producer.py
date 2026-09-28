@@ -1,17 +1,23 @@
 """Replay NYC TLC yellow-taxi trips into Kafka as a live event stream.
 
-Built up over Steps 6 to 9. It replays one month of trips in event-time order
-at a chosen speed and sends each one to Kafka, keyed by pickup zone.
+It replays one month of trips in event-time order at a chosen speed and sends
+each one to Kafka, keyed by pickup zone. Optional chaos knobs deliver some events
+late (out of order) and some twice, so the pipeline downstream has real
+problems to handle.
 
 Run from the project root (Kafka must be running):
     python producer/replay_producer.py --limit 5000
+    python producer/replay_producer.py --late-rate 0.05 --dup-rate 0.02
     python producer/replay_producer.py --dry-run --speed 1 --limit 30
 """
 
 import argparse
+import heapq
+import itertools
 import json
 import logging
 import math
+import random
 import re
 import sys
 import time
@@ -46,7 +52,8 @@ COLUMNS = {
 ID_FIELDS = ("vendor_id", "pickup_time", "event_time", "pu_location_id", "do_location_id", "total_amount")
 ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "streaming-lakehouse/taxi-trip")
 
-LOG_EVERY_S = 10  # how often to print a progress line
+LOG_EVERY_S = 10     # how often to print a progress line
+DUP_WINDOW_S = 300   # duplicates arrive up to 5 minutes (event time) after the original
 
 
 def month_bounds(path: str, month: str | None) -> tuple[datetime, datetime]:
@@ -152,13 +159,16 @@ class StdoutSink:
 
 
 class Replayer:
-    """Sends events on a replay clock: at speed 60, one minute of trips plays in one second."""
+    """Sends events on a replay clock: at speed 60, one minute of trips plays in one second.
+    Late and duplicate deliveries wait in a queue until the replay reaches their release time."""
 
     def __init__(self, sink, speed: float):
         self.sink = sink
         self.speed = speed
         self.wall_start = time.monotonic()  # a clock that never jumps, unlike the time of day
-        self.sent = 0
+        self.pending = []                   # held events, always popped earliest release first
+        self.seq = itertools.count()        # tie-breaker so two events due at the same time don't clash
+        self.sent = self.late = self.dups = 0
         self._last_log, self._last_sent = self.wall_start, 0
 
     def pace(self, t: float) -> None:
@@ -167,6 +177,17 @@ class Replayer:
             delay = self.wall_start + t / self.speed - time.monotonic()
             if delay > 0.001:
                 time.sleep(delay)
+
+    def hold(self, release_at: float, key: str, event: dict) -> None:
+        """Keep an event back until the replay reaches release_at (seconds into the replay)."""
+        heapq.heappush(self.pending, (release_at, next(self.seq), key, event))
+
+    def release_until(self, t: float) -> None:
+        """Send every held event whose release time has come."""
+        while self.pending and self.pending[0][0] <= t:
+            release_at, _, key, event = heapq.heappop(self.pending)
+            self.pace(release_at)
+            self.emit(key, event)
 
     def emit(self, key: str, event: dict) -> None:
         # produced_at is the real time it was sent, so later we can measure end-to-end delay
@@ -177,7 +198,8 @@ class Replayer:
         now = time.monotonic()
         if now - self._last_log >= LOG_EVERY_S:
             rate = (self.sent - self._last_sent) / (now - self._last_log)
-            log.info("sent=%s  rate=%.0f ev/s  event_time=%s", f"{self.sent:,}", rate, event["event_time"])
+            log.info("sent=%s  rate=%.0f ev/s  event_time=%s  held=%d",
+                     f"{self.sent:,}", rate, event["event_time"], len(self.pending))
             self._last_log, self._last_sent = now, self.sent
 
 
@@ -187,24 +209,40 @@ def run(args: argparse.Namespace) -> int:
         log.error("No trips to replay.")
         return 1
 
+    rng = random.Random(args.seed)  # same seed, same "random" choices: runs are repeatable
+    late_max_s = args.late_max_minutes * 60
     sink = StdoutSink() if args.dry_run else KafkaSink(args.bootstrap, args.topic)
     replayer = Replayer(sink, args.speed)
     t0 = table["event_time"][0].as_py()
     target = "stdout" if args.dry_run else f"{args.bootstrap} / {args.topic}"
     speed = f"{args.speed:g}x" if args.speed else "max speed"
-    log.info("Replaying to %s at %s. Ctrl+C to stop.", target, speed)
+    log.info("Replaying to %s at %s (late %.1f%%, duplicates %.1f%%). Ctrl+C to stop.",
+             target, speed, args.late_rate * 100, args.dup_rate * 100)
     try:
         # Convert rows to Python in chunks of 50,000 rather than all 3.5 million at once
         for batch in table.to_batches(max_chunksize=50_000):
             for row in batch.to_pylist():
                 t = (row["event_time"] - t0).total_seconds()  # how far into the replay this trip is
+                key = str(row["pu_location_id"])
+                event = to_event(row)
+
+                replayer.release_until(t)  # first send any held events that are now due
                 replayer.pace(t)
-                replayer.emit(str(row["pu_location_id"]), to_event(row))
+                if rng.random() < args.late_rate:
+                    replayer.late += 1
+                    replayer.hold(t + rng.uniform(1, late_max_s), key, event)
+                else:
+                    replayer.emit(key, event)
+                if rng.random() < args.dup_rate:
+                    replayer.dups += 1
+                    replayer.hold(t + rng.uniform(0, DUP_WINDOW_S), key, event)
+        replayer.release_until(math.inf)  # the month is over: send everything still held
     except KeyboardInterrupt:
-        log.info("Interrupted.")
+        log.info("Interrupted. %d held events were not sent.", len(replayer.pending))
 
     failures = sink.close()
-    log.info("Done: %s events sent, %s failures", f"{replayer.sent:,}", failures)
+    log.info("Done: %s events sent (%s held back as late, %s duplicates), %s failures",
+             f"{replayer.sent:,}", f"{replayer.late:,}", f"{replayer.dups:,}", failures)
     return 1 if failures else 0
 
 
@@ -220,9 +258,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--speed", type=float, default=60.0,
                    help="replay speed vs. real time; 60 = one minute of trips per second, "
                         "0 = as fast as possible (default: %(default)s)")
+    p.add_argument("--late-rate", type=float, default=0.0, help="fraction of events delivered late, e.g. 0.05")
+    p.add_argument("--late-max-minutes", type=float, default=15.0,
+                   help="how late (in event-time minutes) a late event can be (default: %(default)s)")
+    p.add_argument("--dup-rate", type=float, default=0.0, help="fraction of events delivered twice, e.g. 0.02")
+    p.add_argument("--seed", type=int, default=42, help="random seed for the chaos knobs (default: %(default)s)")
     args = p.parse_args(argv)
     if args.speed < 0:
         p.error("--speed must be 0 or more")
+    for flag in ("late_rate", "dup_rate"):
+        if not 0 <= getattr(args, flag) <= 1:
+            p.error(f"--{flag.replace('_', '-')} must be between 0 and 1")
     return args
 
 
