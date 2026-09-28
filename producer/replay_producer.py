@@ -1,11 +1,11 @@
 """Replay NYC TLC yellow-taxi trips into Kafka as a live event stream.
 
-Built up over Steps 6 to 9. For now it loads one month of trips, turns each
-trip into an event, and prints the first few so you can see what they look like.
+Built up over Steps 6 to 9. For now it replays one month of trips in event-time
+order at a chosen speed, printing each event instead of sending it to Kafka.
 
 Run from the project root:
-    python producer/replay_producer.py
-    python producer/replay_producer.py --file data/yellow_tripdata_2025-02.parquet
+    python producer/replay_producer.py --speed 1 --limit 30
+    python producer/replay_producer.py > /dev/null
 """
 
 import argparse
@@ -14,8 +14,9 @@ import logging
 import math
 import re
 import sys
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -44,6 +45,8 @@ COLUMNS = {
 # so if it's ever delivered twice, the pipeline can spot the duplicate.
 ID_FIELDS = ("vendor_id", "pickup_time", "event_time", "pu_location_id", "do_location_id", "total_amount")
 ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "streaming-lakehouse/taxi-trip")
+
+LOG_EVERY_S = 10  # how often to print a progress line
 
 
 def month_bounds(path: str, month: str | None) -> tuple[datetime, datetime]:
@@ -94,25 +97,91 @@ def to_event(row: dict) -> dict:
     return event
 
 
+class StdoutSink:
+    """Where events go for now: printed as `key<TAB>json`. Step 8 adds a Kafka sink."""
+
+    def send(self, key: str, value: bytes) -> None:
+        sys.stdout.write(f"{key}\t{value.decode()}\n")
+
+    def close(self) -> int:
+        sys.stdout.flush()
+        return 0  # number of failed sends
+
+
+class Replayer:
+    """Sends events on a replay clock: at speed 60, one minute of trips plays in one second."""
+
+    def __init__(self, sink, speed: float):
+        self.sink = sink
+        self.speed = speed
+        self.wall_start = time.monotonic()  # a clock that never jumps, unlike the time of day
+        self.sent = 0
+        self._last_log, self._last_sent = self.wall_start, 0
+
+    def pace(self, t: float) -> None:
+        """Wait until the event t seconds into the replay is due (no waiting at speed 0)."""
+        if self.speed > 0:
+            delay = self.wall_start + t / self.speed - time.monotonic()
+            if delay > 0.001:
+                time.sleep(delay)
+
+    def emit(self, key: str, event: dict) -> None:
+        # produced_at is the real time it was sent, so later we can measure end-to-end delay
+        payload = {**event, "produced_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
+        self.sink.send(key, json.dumps(payload, separators=(",", ":")).encode())
+        self.sent += 1
+
+        now = time.monotonic()
+        if now - self._last_log >= LOG_EVERY_S:
+            rate = (self.sent - self._last_sent) / (now - self._last_log)
+            log.info("sent=%s  rate=%.0f ev/s  event_time=%s", f"{self.sent:,}", rate, event["event_time"])
+            self._last_log, self._last_sent = now, self.sent
+
+
+def run(args: argparse.Namespace) -> int:
+    table = load_trips(args.file, args.month, args.limit)
+    if table.num_rows == 0:
+        log.error("No trips to replay.")
+        return 1
+
+    sink = StdoutSink()
+    replayer = Replayer(sink, args.speed)
+    t0 = table["event_time"][0].as_py()
+    log.info("Replaying at %s. Ctrl+C to stop.", f"{args.speed:g}x" if args.speed else "max speed")
+    try:
+        # Convert rows to Python in chunks of 50,000 rather than all 3.5 million at once
+        for batch in table.to_batches(max_chunksize=50_000):
+            for row in batch.to_pylist():
+                t = (row["event_time"] - t0).total_seconds()  # how far into the replay this trip is
+                replayer.pace(t)
+                replayer.emit(str(row["pu_location_id"]), to_event(row))
+    except KeyboardInterrupt:
+        log.info("Interrupted.")
+
+    failures = sink.close()
+    log.info("Done: %s events sent, %s failures", f"{replayer.sent:,}", failures)
+    return 1 if failures else 0
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--file", default="data/yellow_tripdata_2025-01.parquet",
                    help="NYC TLC yellow taxi parquet file (default: %(default)s)")
     p.add_argument("--month", help="YYYY-MM the file covers (default: read from the file name)")
     p.add_argument("--limit", type=int, help="stop after this many trips")
-    return p.parse_args(argv)
+    p.add_argument("--speed", type=float, default=60.0,
+                   help="replay speed vs. real time; 60 = one minute of trips per second, "
+                        "0 = as fast as possible (default: %(default)s)")
+    args = p.parse_args(argv)
+    if args.speed < 0:
+        p.error("--speed must be 0 or more")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    table = load_trips(args.file, args.month, args.limit)
-
-    # Preview the first 3 events. Step 7 replaces this with the real replay loop.
-    for row in table.slice(0, 3).to_pylist():
-        print(json.dumps(to_event(row), indent=2))
-    return 0
+    return run(args)
 
 
 if __name__ == "__main__":
