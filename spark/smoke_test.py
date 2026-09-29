@@ -4,6 +4,8 @@ Run from the project root:
     python spark/smoke_test.py
 """
 
+import time
+
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
@@ -21,5 +23,12 @@ print(f"\nSpark {spark.version} read {trips.count():,} trips from the parquet fi
 print("Busiest pickup zones (compare with Step 5):")
 trips.groupBy("PULocationID").count().orderBy(F.desc("count")).show(5)
 
-input("Spark's web UI is at http://localhost:4040 while this waits. Press Enter to stop... ")
+# Keep Spark alive so its web UI can be opened. Ctrl+C stops it; stray Enter presses don't.
+print(f"Spark UI: {spark.sparkContext.uiWebUrl}  (http://localhost:4040 works too)")
+print("Spark is still running so you can look at the UI. Press Ctrl+C here to stop.")
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\nStopping Spark.")
 spark.stop()
